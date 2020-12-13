@@ -1,0 +1,146 @@
+#!/bin/sh
+
+#set -x
+
+# needed for some binaries
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+
+# disable kernel logging to stdout...
+dmesg -n 1
+
+
+# proc, sysfs
+mount -t proc proc /proc
+mount -n -t sysfs -o nodev,noexec,nosuid sysfs /sys
+
+
+# devfs
+mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null || mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
+
+[ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
+
+[ -d /dev/pts ] || mkdir -m 755 /dev/pts
+mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+
+
+# shared memory area (later system will need it)
+[ -d /dev/shm ] || mkdir /dev/shm
+mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+
+
+# cgroup
+mount -n -t tmpfs -o nodev,noexec,nosuid,mode=755,size=64k cgroup_root /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup/            # cgroup v2 kernel 5.x
+#mount -t cgroup -o all cgroup /sys/fs/cgroup # cgroup v1
+
+
+# detect hardware and initialize drivers
+grep -h MODALIAS /sys/bus/*/devices/*/uevent | cut -d= -f2 | xargs modprobe -abq 2> /dev/null
+grep -h MODALIAS /sys/bus/*/devices/*/uevent | cut -d= -f2 | xargs modprobe -abq 2> /dev/null
+
+
+# udhcpc needs...
+mkdir /run/resolvconf
+touch /run/resolvconf/resolv.conf
+
+
+# crun services
+crun run --no-pivot -b /containers/services/rngd -d --pid-file=/run/crun/rngd.pid rngd &> /var/log/rngd.log
+crun run --no-pivot -b /containers/services/mdevd -d --pid-file=/run/crun/mdevd.pid mdevd &> /var/log/mdevd.log
+crun run --no-pivot -b /containers/services/udhcpc -d --pid-file=/run/crun/udhcpc.pid udhcpc &> /var/log/udhcpc.log
+
+
+exec /bin/busybox init
+
+
+
+# create rootfs partition (tmpfs)
+#mount -t tmpfs -o size=100m tmpfs /newroot
+mount -t tmpfs tmpfs /newroot
+
+
+# create root filesystem
+( 
+	cd newroot && \
+	mkdir -p bin sbin usr/bin usr/sbin proc dev sys tmp run/resolvconf var/log var/lib
+)
+
+#cp -aH /bin/busybox /bin/crun /bin/rustysd /bin/undocker /newroot/bin/
+#cp -a /lib /etc /containers /newroot/
+cp -aH /bin/busybox /newroot/bin/
+cp -a /lib /etc /usr /newroot/
+
+
+# prepare switch root 
+mount --move /sys /newroot/sys
+mount --move /proc /newroot/proc
+mount --move /dev /newroot/dev
+
+# mount tmp as tmpfs
+#mount -t tmpfs tmpfs /newroot/tmp
+#mount -t tmpfs tmpfs /newroot/run
+
+
+# install busybox to newroot
+chroot /newroot /bin/busybox --install -s
+rm -f /newroot/linuxrc 
+
+
+# Mount persistent partition
+echo -n "Try to mount persistent disk partition... "
+DEV=$(chroot /newroot blkid | awk '/K3OS_DATA/ {print $1}' | tr -d ':')
+if [ ! -z "$DEV" ]; then
+    chroot /newroot mount $DEV /var/lib
+    echo "DONE!"
+else
+    echo "No partition LABEL=K3S_DATA found"
+fi
+
+
+# symlink
+chroot /newroot ln -s /run /var/run
+chroot /newroot ln -s /tmp /var/tmp
+chroot /newroot ln -s /bin/k3s /bin/kubectl
+chroot /newroot ln -s /bin/k3s /bin/ctr
+
+
+# mount fstab
+#chroot /newroot mount -a
+
+
+# if no k3s available use helper script
+echo -n "Prepare k3s binary... "
+DIR="var/lib/engine"
+if [ -f "/newroot/$DIR/k3s" ]; then
+    echo "File '/newroot/$DIR/k3s' exists"
+    chroot /newroot ln -fs /$DIR/k3s /bin/k3s
+else
+    echo "File '/newroot/$DIR/k3s' not exists"
+    mkdir -p /newroot/$DIR
+    cp -a /bin/k3s /newroot/$DIR/k3s
+    chroot /newroot ln -fs /$DIR/k3s /bin/k3s
+fi
+echo "DONE!"
+
+
+# overlay mounts
+echo -n "Mount overlayfs directories... "
+DST="/var/lib/overlay"
+LIST="/etc"
+for SRC in $LIST; do
+    chroot /newroot mkdir -p $DST$SRC/work $DST$SRC/upper
+    chroot /newroot mount -t overlay overlay -o lowerdir=$SRC,upperdir=$DST$SRC/upper,workdir=$DST$SRC/work $SRC
+done
+echo "DONE!"
+
+
+# initialize initrd networking
+hostname localhost
+ip link set up dev lo
+ip a a 128.0.0.1/32 dev lo
+ip link set up dev eth0
+
+
+# leave initrd, use newroot
+exec switch_root /newroot /bin/busybox init
